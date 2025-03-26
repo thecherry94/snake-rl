@@ -2,6 +2,7 @@ import pygame
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+from gymnasium.spaces import Dict, Box # Import Dict and Box space
 from collections import deque
 import random
 from enum import Enum
@@ -37,7 +38,7 @@ class Point:
         self.y = y
 
     def __eq__(self, other):
-        return self.x == other.x and self.y == other.y
+        return isinstance(other, Point) and self.x == other.x and self.y == other.y
 
     def __hash__(self):
         return hash((self.x, self.y))
@@ -53,25 +54,29 @@ class SnakeEnv(gym.Env):
     """
     Custom Environment for Snake game that follows gym interface.
 
-    Observation Space:
-    A vector containing information about the snake's surroundings,
-    its direction, and the relative position of the food.
-    Features:
-    1. Danger Straight (1.0 if wall/body 1 step ahead, 0.0 otherwise)
-    2. Danger Left     (1.0 if wall/body 1 step left relative to direction)
-    3. Danger Right    (1.0 if wall/body 1 step right relative to direction)
-    4. Direction Left  (1.0 if current direction is Left)
-    5. Direction Right (1.0 if current direction is Right)
-    6. Direction Up    (1.0 if current direction is Up)
-    7. Direction Down  (1.0 if current direction is Down)
-    8. Food Delta X    (Normalized difference in x: (food.x - head.x) / GRID_SIZE)
-    9. Food Delta Y    (Normalized difference in y: (food.y - head.y) / GRID_SIZE)
-    10. Tail Delta X   (Normalized difference in x: (tail.x - head.x) / GRID_SIZE) - Helps avoid cycles
-    11. Tail Delta Y   (Normalized difference in y: (tail.y - head.y) / GRID_SIZE) - Helps avoid cycles
+    Observation Space (Multi-Input):
+    A dictionary containing:
+    - "mlp_features": Vector with hand-crafted features:
+        1. Danger Straight (1 step)
+        2. Danger Left (1 step)
+        3. Danger Right (1 step)
+        4. Direction Left
+        5. Direction Right
+        6. Direction Up
+        7. Direction Down
+        8. Food Delta X (Normalized)
+        9. Food Delta Y (Normalized)
+        10. Tail Delta X (Normalized)
+        11. Tail Delta Y (Normalized)
+        12. Danger Straight (2 steps)
+        13. Danger Left Diagonal (1 step ahead)
+        14. Danger Right Diagonal (1 step ahead)
+    - "cnn_features": A small grid centered on the snake's head.
+        - Shape: (1, cnn_grid_size, cnn_grid_size)
+        - Values: 0 (Empty), 0.25 (Wall), 0.5 (Body), 0.75 (Head), 1.0 (Food)
 
     Action Space:
-    Discrete(4) representing UP, DOWN, LEFT, RIGHT.
-    Note: The environment internally prevents the snake from reversing direction.
+    Discrete(4) representing RIGHT, LEFT, UP, DOWN.
 
     Reward Structure:
     - +10.0 for eating food.
@@ -80,31 +85,39 @@ class SnakeEnv(gym.Env):
     - -0.15 for moving further away from the food.
     - -0.01 penalty per step to encourage efficiency.
 
-    Termination:
-    The episode ends if the snake collides with the wall or itself.
-
-    Truncation:
-    The episode can be truncated if it exceeds a maximum number of steps
-    without eating food, preventing infinite loops in sparse reward scenarios.
+    Termination: Collision with wall or self.
+    Truncation: Exceeding max steps without eating food.
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": INITIAL_SPEED}
 
-    def __init__(self, render_mode=None, grid_size=GRID_SIZE, max_steps_no_food=GRID_SIZE*GRID_SIZE*2):
+    def __init__(self, render_mode=None, grid_size=GRID_SIZE, max_steps_no_food=GRID_SIZE*GRID_SIZE*2, cnn_grid_size=9):
         super().__init__()
 
         self.grid_size = grid_size
         self.window_width = self.grid_size * CELL_SIZE
         self.window_height = self.grid_size * CELL_SIZE + 40
         self.max_steps_no_food = max_steps_no_food # Truncation limit
+        self.cnn_grid_size = cnn_grid_size # Size of the local grid view (e.g., 7x7)
+        assert self.cnn_grid_size % 2 != 0, "CNN grid size must be odd"
+        self.cnn_half_grid = self.cnn_grid_size // 2
 
-        # Define action and observation space
-        # Actions: 0: Right, 1: Left, 2: Up, 3: Down (matches Direction Enum)
-        self.action_space = spaces.Discrete(4)
+        # --- Define action space ---
+        self.action_space = spaces.Discrete(4) # 0: Right, 1: Left, 2: Up, 3: Down
 
-        # Observation space: See docstring for details
-        # Using Box for continuous/binary features. Normalized values where applicable.
-        # Danger flags (3), Direction flags (4), Food delta (2), Tail delta (2)
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(11,), dtype=np.float32)
+        # --- Define observation space (Multi-Input: MLP features + CNN features) ---
+        # MLP Features: Enhanced set
+        mlp_feature_count = 14
+        mlp_low = np.full(mlp_feature_count, -1.0, dtype=np.float32)
+        mlp_high = np.full(mlp_feature_count, 1.0, dtype=np.float32)
+
+        # CNN Features: Local grid view around the head
+        cnn_shape = (1, self.cnn_grid_size, self.cnn_grid_size)
+
+        self.observation_space = Dict({
+            "mlp_features": Box(low=mlp_low, high=mlp_high, dtype=np.float32),
+            "cnn_features": Box(low=0.0, high=1.0, shape=cnn_shape, dtype=np.float32)
+        })
+        # --- End Observation Space Definition ---
 
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
@@ -168,48 +181,109 @@ class SnakeEnv(gym.Env):
         return {"score": self.score, "length": len(self.snake)}
 
     def _get_observation(self):
-        # --- Calculate Danger ---
-        # Points relative to the current direction
+        # --- 1. Calculate MLP Features ---
+        # Danger Straight, Left, Right (1 step)
         point_ahead = self._get_next_head_position(self.direction)
         point_left_rel, point_right_rel = self._get_relative_points(self.direction)
+        point_left_abs = self.head + point_left_rel
+        point_right_abs = self.head + point_right_rel
 
-        danger_straight = self._is_collision(point_ahead)
-        danger_left = self._is_collision(self.head + point_left_rel)
-        danger_right = self._is_collision(self.head + point_right_rel)
+        danger_straight = float(self._is_collision(point_ahead))
+        danger_left = float(self._is_collision(point_left_abs))
+        danger_right = float(self._is_collision(point_right_abs))
 
-        # --- Direction Flags (One-Hot Encoding) ---
-        dir_l = self.direction == Direction.LEFT
-        dir_r = self.direction == Direction.RIGHT
-        dir_u = self.direction == Direction.UP
-        dir_d = self.direction == Direction.DOWN
+        # Direction Flags
+        dir_l = float(self.direction == Direction.LEFT)
+        dir_r = float(self.direction == Direction.RIGHT)
+        dir_u = float(self.direction == Direction.UP)
+        dir_d = float(self.direction == Direction.DOWN)
 
-        # --- Food Position ---
-        # Normalized relative coordinates
+        # Food Position (Normalized)
         food_delta_x = (self.food.x - self.head.x) / self.grid_size
         food_delta_y = (self.food.y - self.head.y) / self.grid_size
 
-        # --- Tail Position ---
-        # Normalized relative coordinates of the tail
+        # Tail Position (Normalized)
         tail = self.snake[-1]
         tail_delta_x = (tail.x - self.head.x) / self.grid_size
         tail_delta_y = (tail.y - self.head.y) / self.grid_size
 
+        # --- NEW MLP Features ---
+        # Danger Straight (2 steps)
+        point_ahead_2 = self._get_next_head_position(self.direction, steps=2)
+        danger_straight_2 = float(self._is_collision(point_ahead_2))
 
-        observation = np.array([
-            danger_straight,
-            danger_left,
-            danger_right,
-            dir_l,
-            dir_r,
-            dir_u,
-            dir_d,
-            food_delta_x,
-            food_delta_y,
-            tail_delta_x,
-            tail_delta_y
+        # Danger Diagonals (relative to direction)
+        point_ahead_left_diag = point_ahead + point_left_rel
+        point_ahead_right_diag = point_ahead + point_right_rel
+        danger_left_diag = float(self._is_collision(point_ahead_left_diag))
+        danger_right_diag = float(self._is_collision(point_ahead_right_diag))
+        # --- End NEW MLP Features ---
+
+
+        mlp_features = np.array([
+            danger_straight, danger_left, danger_right,
+            dir_l, dir_r, dir_u, dir_d,
+            food_delta_x, food_delta_y,
+            tail_delta_x, tail_delta_y,
+            danger_straight_2, # New
+            danger_left_diag,  # New
+            danger_right_diag  # New
         ], dtype=np.float32)
 
+        # --- 2. Create CNN Features (Local Grid) ---
+        cnn_features = self._create_local_grid()
+
+        # --- 3. Combine into Dictionary ---
+        observation = {
+            "mlp_features": mlp_features,
+            "cnn_features": cnn_features
+        }
+
         return observation
+
+    def _create_local_grid(self):
+        """
+        Creates a grid centered around the snake's head for the CNN input.
+        Grid contains values representing empty, wall, body, head, food.
+        Returns a numpy array of shape (1, cnn_grid_size, cnn_grid_size).
+        """
+        # Values: 0: Empty, 0.25: Wall, 0.5: Body, 0.75: Head (center), 1.0: Food
+        val_empty = 0.0
+        val_wall = 0.25
+        val_body = 0.5
+        val_head = 0.75 # Although head is always center, good to mark
+        val_food = 1.0
+
+        local_grid = np.full((self.cnn_grid_size, self.cnn_grid_size), val_empty, dtype=np.float32)
+
+        for local_y in range(self.cnn_grid_size):
+            for local_x in range(self.cnn_grid_size):
+                # Calculate world coordinates corresponding to this local grid cell
+                world_x = self.head.x - self.cnn_half_grid + local_x
+                world_y = self.head.y - self.cnn_half_grid + local_y
+                world_point = Point(world_x, world_y)
+
+                # Check for walls
+                if world_x < 0 or world_x >= self.grid_size or \
+                   world_y < 0 or world_y >= self.grid_size:
+                    local_grid[local_y, local_x] = val_wall
+                    continue # Wall takes precedence
+
+                # Check for food
+                if world_point == self.food:
+                    local_grid[local_y, local_x] = val_food
+                    # Continue checking for body parts, body might overlap food visually but food is important
+
+                # Check for snake parts (head and body)
+                # Check head specifically for the center cell (or if it matches)
+                if world_point == self.head:
+                     local_grid[local_y, local_x] = max(local_grid[local_y, local_x], val_head) # Ensure head value if it overlaps food visually
+                elif world_point in self._snake_set:
+                     local_grid[local_y, local_x] = max(local_grid[local_y, local_x], val_body) # Body can overlap food
+
+        # Add channel dimension for SB3 CNN input format (Channels, Height, Width)
+        cnn_input = np.expand_dims(local_grid, axis=0)
+        return cnn_input
 
     def _get_relative_points(self, current_direction):
         # Returns points representing 'left' and 'right' relative to the current direction
@@ -223,16 +297,18 @@ class SnakeEnv(gym.Env):
         elif current_direction == Direction.RIGHT:
             return Point(0, -1), Point(0, 1) # Left (Up), Right (Down)
 
-    def _get_next_head_position(self, direction):
-        # Calculates the potential next position of the head based on a direction
+    def _get_next_head_position(self, direction, steps=1):
+        """Calculates the potential position 'steps' ahead based on a direction."""
+        delta_x, delta_y = 0, 0
         if direction == Direction.RIGHT:
-            return self.head + Point(1, 0)
+            delta_x = steps
         elif direction == Direction.LEFT:
-            return self.head + Point(-1, 0)
+            delta_x = -steps
         elif direction == Direction.DOWN:
-            return self.head + Point(0, 1)
+            delta_y = steps
         elif direction == Direction.UP:
-            return self.head + Point(0, -1)
+            delta_y = -steps
+        return self.head + Point(delta_x, delta_y)
 
     def step(self, action):
         # --- Determine new direction based on action ---
@@ -319,12 +395,8 @@ class SnakeEnv(gym.Env):
         # Check wall collision
         if point.x >= self.grid_size or point.x < 0 or point.y >= self.grid_size or point.y < 0:
             return True
-        # Check self collision (excluding the very tail in the next step if not growing)
+        # Check self collision
         if point in self._snake_set:
-             # Allow moving into the tail's position *only if* the snake is about to move
-             # and therefore vacate that position. This check is implicitly handled by
-             # adding the new head *before* removing the tail in the step function.
-             # So, if point is in _snake_set, it's a collision.
             return True
 
         return False
@@ -351,13 +423,6 @@ class SnakeEnv(gym.Env):
         # Create a surface to draw on
         canvas = pygame.Surface((self.window_width, self.window_height))
         canvas.fill(BLACK)
-
-        # Draw Grid lines (optional, can make it visually clearer)
-        # for x in range(0, self.window_width, CELL_SIZE):
-        #     pygame.draw.line(canvas, WHITE, (x, 0), (x, self.window_height - 40), 1)
-        # for y in range(0, self.window_height - 40, CELL_SIZE):
-        #     pygame.draw.line(canvas, WHITE, (0, y), (self.window_width, y), 1)
-
 
         # Draw snake
         for i, pt in enumerate(self.snake):
@@ -410,17 +475,7 @@ def get_human_action(current_direction):
             elif event.key == pygame.K_q: # Quit key
                  return "QUIT"
 
-    # Prevent reversing if an action was chosen
     if action is not None:
-        opposite_direction = {
-            Direction.UP: Direction.DOWN, Direction.DOWN: Direction.UP,
-            Direction.LEFT: Direction.RIGHT, Direction.RIGHT: Direction.LEFT
-        }
-        # Check if snake length > 1 to allow reversal at start
-        # This logic is handled better inside env.step, but good for direct human control feel
-        # if len(env.snake) > 1 and action == opposite_direction[current_direction]:
-        #     return None # Ignore reverse input, continue current direction implicitly
-
         return action.value # Return the integer value for the environment step
 
-    return None # No valid key pressed or trying to reverse
+    return None # No valid key pressed
