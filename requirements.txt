@@ -1,0 +1,5 @@
+pygame
+gymnasium
+stable-baselines3[extra]
+numpy
+torch # Or tensorflow depending on your SB3 backend preference
